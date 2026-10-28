@@ -180,12 +180,12 @@ def translate(args, B, P, game):
          os.path.join(P, 'ps2xIOP', 'src', 'emulator', 'native', 'iop_aot_modules.cpp')] +
         [f'{k}={os.path.join(irx, v + ".IRX")}' for k, v in mods.items()], log=os.path.join(B, 'iopxlat.log'))
 
-    dst = add_port_sources(P)
+    dst = add_port_sources(P, args.target)
     for f in os.listdir(vu):
         shutil.copy(os.path.join(vu, f), dst)
 
 
-def add_port_sources(P):
+def add_port_sources(P, target):
     step("adding the port's sources")
     dst = os.path.join(P, 'ps2xRuntime', 'src', 'game')
     shutil.rmtree(dst, ignore_errors=True)
@@ -194,6 +194,11 @@ def add_port_sources(P):
         for f in os.listdir(os.path.join(HERE, d)):
             if f.endswith(('.cpp', '.h')):
                 shutil.copy(os.path.join(HERE, d, f), dst)
+    # The macOS SDK has no GL/glcorearb.h: use the Khronos copy (into the runtime's public include dir).
+    if target == 'macos':
+        for d in ('GL', 'KHR'):
+            shutil.copytree(os.path.join(HERE, 'third_party', 'khronos', d),
+                            os.path.join(P, 'ps2xRuntime', 'include', d), dirs_exist_ok=True)
     return dst
 
 
@@ -286,7 +291,7 @@ def check(args, B):
     iop = os.path.join(P, 'ps2xIOP', 'src', 'emulator', 'native', 'iop_aot_modules.cpp')
     if not os.path.isfile(iop):
         open(iop, 'w').write('// placeholder for build.py --check: the real file is generated from the disc\n')
-    add_port_sources(P)
+    add_port_sources(P, args.target)
     defs, env = game_config(args, B, args.target)
     bdir = os.path.join(P, 'out', args.target + '-check')
     step(f'compiling the runtime and the port sources for {args.target}')
@@ -296,7 +301,7 @@ def check(args, B):
                    if '/src/game/' in line.split(':')[0] and line.split(':')[0].endswith(('.o', '.obj'))})
     if not objs:
         sys.exit('no port sources found in the build')
-    run(['ninja', '-C', bdir, '-j', str(args.jobs)] + objs, env=env, log=os.path.join(B, f'check-{args.target}-port.log'))
+    run(['ninja', '-C', bdir, '-k', '0', '-j', str(args.jobs)] + objs, env=env, log=os.path.join(B, f'check-{args.target}-port.log'))
     print(f'\nOK: the PS2Recomp runtime and {len(objs)} port sources compile for {args.target}.')
 
 
