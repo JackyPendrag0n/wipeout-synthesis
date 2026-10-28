@@ -148,7 +148,7 @@ renderer (GL 4.3) is off and the renderer uses its fallbacks.
 
 ```sh
 xcode-select --install
-brew install cmake ninja python
+brew install cmake ninja python pkgconf
 python3 build.py "/path/to/WipEout Fusion.iso"
 ./dist/macos/wipeout-fusion build/game
 ```
