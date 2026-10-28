@@ -249,6 +249,9 @@ def game_config(args, B, target):
         defs['CMAKE_TOOLCHAIN_FILE'] = os.path.join(HERE, 'cmake', 'mingw-w64-x86_64.cmake')
     if target == 'macos':
         defs['CMAKE_OSX_ARCHITECTURES'] = 'x86_64'   # the runtime uses SSE; Apple Silicon runs it under Rosetta 2
+        # On Apple Silicon CMake would report arm64 and PS2Recomp would switch to sse2neon: build as x86-64.
+        defs['CMAKE_SYSTEM_NAME'] = 'Darwin'
+        defs['CMAKE_SYSTEM_PROCESSOR'] = 'x86_64'
         defs['CMAKE_OSX_DEPLOYMENT_TARGET'] = '11.0'
     return defs, env
 
