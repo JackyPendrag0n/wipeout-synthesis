@@ -1,0 +1,725 @@
+--- a/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
++++ b/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
+@@ -552,7 +552,8 @@
+ {
+     if (sizeBytes == 0u)
+         return;
+-    ps2x_capture::notify(ps2x_capture::Vif1Stream, data, sizeBytes);
++    if (!m_vif1Rec)
++        ps2x_capture::notify(ps2x_capture::Vif1Stream, data, sizeBytes);
+ 
+     if (m_vif1Stalled)
+     {
+@@ -649,6 +650,11 @@
+         const bool irq = (cmd & 0x80000000u) != 0u;
+         if (const uint32_t need = vif1CommandDataBytes(cmd, vif1_regs.cycle); need > sizeBytes - pos && need <= (1u << 20))
+         {
++            if (m_vif1Rec)
++            {
++                vif1RecEvent(3u, 0u, 0u, 0u, 0u);
++                return;
++            }
+             m_vif1Carry.assign(data + pos - 4u, data + sizeBytes);
+             m_vif1CarrySegs.clear();
+             appendStallSegments(m_vif1CarrySegs, m_vif1StreamSegs, pos - 4u, 0u);
+@@ -695,7 +701,9 @@
+         // Track most-recent command for VIFn_CODE emulation.
+         vif1_regs.code = cmd;
+         vif1_regs.num = num;
+-        if (irq && !ibitOff && (vif1_regs.err & 1u) == 0u)
++        if (irq && m_vif1Rec)
++            vif1RecEvent(3u, 0u, 0u, 0u, 0u);
++        else if (irq && !ibitOff && (vif1_regs.err & 1u) == 0u)
+             stallNext = true;   // the VIF stalls after this command and raises INTC VIF1
+         if (irq)
+             vif1_regs.stat |= (1u << 11); // INT
+@@ -732,11 +740,15 @@
+         }
+         else if (opcode == VIF_STMOD)
+         {
++            if (m_vif1Rec && (imm & 3u))
++                vif1RecEvent(3u, 0u, 0u, 0u, 0u);
+             vif1_regs.mode = imm & 3u;
+             continue;
+         }
+         else if (opcode == VIF_MSKPATH3)
+         {
++            if (m_vif1Rec)
++                vif1RecEvent(3u, 0u, 0u, 0u, 0u);
+             // VIF command docs: MSKPATH3 uses IMMEDIATE bit 15.
+             const bool wasMasked = m_path3Masked;
+             m_path3Masked = (imm & 0x8000u) != 0u;
+@@ -746,6 +758,8 @@
+         }
+         else if (opcode == VIF_MARK)
+         {
++            if (m_vif1Rec)
++                vif1RecEvent(3u, 0u, 0u, 0u, 0u);
+             vif1_regs.mark = imm;
+             vif1_regs.stat |= (1u << 6); // MRK
+             continue;
+@@ -770,7 +784,9 @@
+                 vif1_regs.tops = (vif1_regs.base + vif1_regs.ofst) & 0x3FFu;
+             vif1_regs.stat ^= (1u << 7); // toggle DBF
+ 
+-            if (m_vu1MscalCallback)
++            if (m_vif1Rec)
++                vif1RecEvent(1u, startPC, 0u, runTop, runItop);
++            else if (m_vu1MscalCallback)
+                 m_vu1MscalCallback(startPC, runTop, runItop);
+             continue;
+         }
+@@ -788,7 +804,9 @@
+                 vif1_regs.tops = (vif1_regs.base + vif1_regs.ofst) & 0x3FFu;
+             vif1_regs.stat ^= (1u << 7); // toggle DBF
+ 
+-            if (m_vu1MscntCallback)
++            if (m_vif1Rec)
++                vif1RecEvent(2u, 0u, 0u, runTop, runItop);
++            else if (m_vu1MscntCallback)
+                 m_vu1MscntCallback(runTop, runItop);
+             continue;
+         }
+@@ -820,6 +838,8 @@
+         }
+         else if (opcode == VIF_MPG)
+         {
++            if (m_vif1Rec)
++                vif1RecEvent(3u, 0u, 0u, 0u, 0u);
+             uint32_t destAddr = (uint32_t)imm * 8u;
+             const uint32_t instructionCount = (num == 0u) ? 256u : static_cast<uint32_t>(num);
+             const uint32_t mpgBytes = instructionCount * 8u;
+@@ -850,6 +870,17 @@
+                 qwCount = availableQw;
+ 
+             const bool directHl = (opcode == VIF_DIRECTHL);
++            if (m_vif1Rec)
++            {
++                if (directHl || truncated || m_vif1PendingPath2ImageQwc != 0u || pendingGifImageQwc(data + pos, qwCount * 16u) != 0u)
++                    vif1RecEvent(3u, 0u, 0u, 0u, 0u);
++                else
++                    vif1RecEvent(0u, pos, qwCount * 16u, 0u, 0u);
++                pos += qwCount * 16u;
++                if (truncated)
++                    break;
++                continue;
++            }
+             uint32_t skipQw = 0u;
+             if (qwCount > 0 && m_vif1PendingPath2ImageQwc != 0u)
+             {
+@@ -1296,3 +1327,396 @@
+     if (stallNext)
+         stall(sizeBytes);
+ }
++
++// ---------------------------------------------------------------------------------------------
++// Model packet cache. The game's meshes are prebuilt VIF packets in RAM that the frame's DMA chain
++// CALLs (or REFs) once per object: STCYCL/STMASK, UNPACKs into the double buffer, MSCNT, plus a
++// DIRECT GIF packet for the draw state. Such a packet is compiled the second time it is seen with
++// the same bytes: the interpreter runs it twice against probe VU memories filled with 0 and with
++// ~0, and a lane that comes out equal in both is a write (with that value) of the segment before
++// each event. Replaying is then a list of masked 16-byte stores, the GIF submits and the MSCAL /
++// MSCNT callbacks, with the VIF registers set as the interpreter leaves them. A packet is keyed by
++// its address, a hash of its bytes and the VIF state it starts from (cycle, mask, mode, row, col,
++// TOPS/BASE/OFST/DBF, ITOPS). RT_VIFCACHE=0 turns it off; RT_VIFCACHECHECK=1 runs the interpreter
++// alongside each replay on a shadow of VU memory and compares memory, events and registers.
++// ---------------------------------------------------------------------------------------------
++#include <unordered_map>
++#include <deque>
++
++namespace
++{
++    struct VcWrite
++    {
++        __m128i v, m;   // value (already masked) and lane mask
++        uint32_t qw;
++    };
++    struct VcRun
++    {
++        uint32_t qw, n, val;
++    };
++    struct VcEvent
++    {
++        uint32_t kind, a, b, top, itop, tops, dbf, wEnd, rEnd;   // kind 0 GIF (a = payload offset, b = bytes), 1 MSCAL (a = pc), 2 MSCNT
++    };
++    struct VcKey
++    {
++        uint32_t cycle, mask, mode, itops, base, ofst, tops, dbf, row[4], col[4], tte;
++        bool operator==(const VcKey &o) const { return std::memcmp(this, &o, sizeof(VcKey)) == 0; }
++    };
++    struct VcPacket
++    {
++        uint64_t hash = 0, serial = 0;
++        VcKey key{};
++        bool bad = false;
++        std::vector<VcRun> runs;      // whole qwords: copied from vals
++        std::vector<__m128i> vals;
++        std::vector<VcWrite> w;       // qwords with some lanes kept
++        std::vector<VcEvent> ev;
++        VIFRegisters fin{};
++    };
++    struct VcSlot
++    {
++        std::deque<VcPacket> v;
++        uint64_t lastHash = 0;
++        uint32_t seen = 0, rehash = 0;
++        bool dynamic = false;
++    };
++
++    uint64_t vcHash(const uint8_t *tte, const uint8_t *p, uint32_t n)
++    {
++        // Eight independent multiply-rotate chains, one per word of a 64-byte block (n is a multiple of 16).
++        uint64_t h[8];
++        for (int k = 0; k < 8; ++k)
++            h[k] = 0x9E3779B97F4A7C15ull * (k + 1) ^ n;
++        if (tte)
++        {
++            uint64_t t;
++            std::memcpy(&t, tte, 8);
++            h[0] ^= t;
++        }
++        auto mix = [](uint64_t x, uint64_t v) { x = (x ^ v) * 0x87C37B91114253D5ull; return (x << 31) | (x >> 33); };
++        uint32_t i = 0;
++        for (; i + 64u <= n; i += 64u)
++        {
++            uint64_t v[8];
++            std::memcpy(v, p + i, 64);
++            for (int k = 0; k < 8; ++k)
++                h[k] = mix(h[k], v[k]);
++        }
++        for (int k = 0; i + 8u <= n; i += 8u, ++k)
++        {
++            uint64_t v;
++            std::memcpy(&v, p + i, 8);
++            h[k] = mix(h[k], v);
++        }
++        uint64_t r = 0;
++        for (int k = 0; k < 8; ++k)
++            r = (r ^ h[k]) * 0xC2B2AE3D27D4EB4Full + (r >> 29);
++        return r;
++    }
++
++    struct VcCur
++    {
++        uint32_t r = 0, w = 0;
++    };
++    // The packet's writes up to an event (rEnd/wEnd), or to the end.
++    void vcApply(uint8_t *vu, const VcPacket &p, VcCur &c, uint32_t rEnd, uint32_t wEnd)
++    {
++        for (; c.r < rEnd; ++c.r)
++        {
++            const VcRun &r = p.runs[c.r];
++            std::memcpy(vu + r.qw * 16u, p.vals.data() + r.val, r.n * 16u);
++        }
++        for (; c.w < wEnd; ++c.w)
++        {
++            const VcWrite &w = p.w[c.w];
++            __m128i *d = reinterpret_cast<__m128i *>(vu + w.qw * 16u);
++            _mm_storeu_si128(d, _mm_or_si128(_mm_andnot_si128(w.m, _mm_loadu_si128(d)), w.v));
++        }
++    }
++    void vcApplyAll(uint8_t *vu, const VcPacket &p, VcCur &c)
++    {
++        vcApply(vu, p, c, static_cast<uint32_t>(p.runs.size()), static_cast<uint32_t>(p.w.size()));
++    }}
++
++struct PS2Memory::Vif1Recorder
++{
++    bool bad = false, check = false;
++    uint32_t fill = 0;
++    std::vector<std::vector<uint8_t>> snaps;
++    std::vector<VcEvent> ev;
++    // check mode
++    const VcPacket *pkt = nullptr;
++    const uint8_t *data = nullptr;
++    uint32_t tteLen = 0;
++    uint8_t *real = nullptr;
++    size_t idx = 0;
++    VcCur cur;
++    uint64_t mismatches = 0;
++};
++
++struct PS2Memory::Vif1PacketCache
++{
++    std::unordered_map<uint32_t, VcSlot> slots;
++    uint64_t replays = 0, compiles = 0, bad = 0, interp = 0, checks = 0, checkBad = 0, bytes = 0;
++};
++
++void PS2Memory::vif1RecEvent(uint32_t kind, uint32_t a, uint32_t b, uint32_t top, uint32_t itop)
++{
++    Vif1Recorder &r = *m_vif1Rec;
++    if (kind == 3u)
++    {
++        r.bad = true;
++        return;
++    }
++    const VcEvent e{kind, a, b, top, itop, vif1_regs.tops, vif1_regs.stat & 0x80u, 0u};
++    if (!r.check)
++    {
++        r.ev.push_back(e);
++        r.snaps.emplace_back(m_vu1Data, m_vu1Data + PS2_VU1_DATA_SIZE);
++        std::memset(m_vu1Data, static_cast<int>(r.fill & 0xFFu), PS2_VU1_DATA_SIZE);
++        return;
++    }
++    // Check: bring the real memory to this event with the cached writes, compare with the
++    // interpreter's shadow, then do the event for real.
++    uint8_t *shadow = m_vu1Data;
++    const VcPacket &p = *r.pkt;
++    bool ok = r.idx < p.ev.size();
++    if (ok)
++    {
++        const VcEvent &c = p.ev[r.idx];
++        vcApply(r.real, p, r.cur, c.rEnd, c.wEnd);
++        ok = c.kind == kind && c.a + (kind == 0u ? r.tteLen : 0u) == a && c.b == b && c.top == top && c.itop == itop &&
++             c.tops == e.tops && c.dbf == e.dbf && std::memcmp(r.real, shadow, PS2_VU1_DATA_SIZE) == 0;
++    }
++    if (!ok && r.mismatches++ < 8)
++        std::fprintf(stderr, "[vifcache] CHECK MISMATCH at event %zu (kind %u)\n", r.idx, kind);
++    ++r.idx;
++    m_vu1Data = r.real;
++    m_vif1Rec = nullptr;
++    if (kind == 0u)
++        submitGifPacket(GifPathId::Path2, r.data + a, b, true, false);
++    else if (kind == 1u && m_vu1MscalCallback)
++        m_vu1MscalCallback(a, top, itop);
++    else if (kind == 2u && m_vu1MscntCallback)
++        m_vu1MscntCallback(top, itop);
++    m_vif1Rec = &r;
++    m_vu1Data = shadow;
++    std::memcpy(shadow, r.real, PS2_VU1_DATA_SIZE);
++}
++
++bool PS2Memory::replayVif1Packet(const uint8_t *tte, uint32_t phys, uint32_t bytes)
++{
++    static const bool off = std::getenv("RT_VIFCACHE") && std::atoi(std::getenv("RT_VIFCACHE")) == 0;
++    static const bool checkMode = std::getenv("RT_VIFCACHECHECK") != nullptr;
++    if (off || !m_vu1Data || m_vif1Rec || m_vif1Stalled || !m_vif1Carry.empty() || m_vif1PendingPath2ImageQwc != 0u ||
++        bytes < 256u || phys + bytes > PS2_RAM_SIZE)
++        return false;
++    if (!m_vif1Cache)
++        m_vif1Cache = new Vif1PacketCache();
++    Vif1PacketCache &C = *m_vif1Cache;
++    const uint8_t *src = m_rdram + phys;
++    VcSlot &slot = C.slots[phys];
++    if (slot.dynamic)
++        return false;
++    static const bool timing = std::getenv("RT_VIFCACHETIME") != nullptr;
++    static uint64_t tHash = 0, tApply = 0, tN = 0, tW = 0;
++    uint64_t t0 = timing ? __rdtsc() : 0;
++    const uint64_t h = vcHash(tte, src, bytes);
++    if (timing)
++        tHash += __rdtsc() - t0;
++    VcKey key{};
++    key.cycle = vif1_regs.cycle, key.mask = vif1_regs.mask, key.mode = vif1_regs.mode, key.itops = vif1_regs.itops;
++    key.base = vif1_regs.base, key.ofst = vif1_regs.ofst, key.tops = vif1_regs.tops, key.dbf = vif1_regs.stat & 0x80u;
++    std::memcpy(key.row, vif1_regs.row, 16);
++    std::memcpy(key.col, vif1_regs.col, 16);
++    key.tte = tte ? 1u : 0u;
++
++    const VcPacket *pk = nullptr;
++    for (const VcPacket &p : slot.v)
++        if (p.hash == h && p.key == key)
++            pk = &p;
++    if (!pk)
++    {
++        if (slot.lastHash != h)
++        {
++            if (slot.seen && ++slot.rehash > 16u)
++            {
++                slot.dynamic = true;   // rewritten every frame or so: not a model packet
++                slot.v.clear();
++            }
++            slot.lastHash = h;
++            slot.seen = 1;
++            ++C.interp;
++            return false;
++        }
++        if (++slot.seen < 2u)
++        {
++            ++C.interp;
++            return false;
++        }
++        // Compile: two interpreter runs on probe memories.
++        const uint32_t tteLen = tte ? 8u : 0u;
++        std::vector<uint8_t> buf(tteLen + bytes);
++        if (tte)
++            std::memcpy(buf.data(), tte, 8);
++        std::memcpy(buf.data() + tteLen, src, bytes);
++        const VIFRegisters saved = vif1_regs;
++        uint8_t *realVu = m_vu1Data;
++        std::vector<uint8_t> probe(PS2_VU1_DATA_SIZE);
++        Vif1Recorder run[2];
++        VIFRegisters fin[2];
++        for (int k = 0; k < 2; ++k)
++        {
++            run[k].fill = k ? 0xFFFFFFFFu : 0u;
++            std::memset(probe.data(), k ? 0xFF : 0, probe.size());
++            m_vu1Data = probe.data();
++            m_vif1Rec = &run[k];
++            processVIF1Data(buf.data(), static_cast<uint32_t>(buf.size()));
++            run[k].snaps.emplace_back(probe.begin(), probe.end());
++            fin[k] = vif1_regs;
++            vif1_regs = saved;
++        }
++        m_vif1Rec = nullptr;
++        m_vu1Data = realVu;
++        VcPacket p;
++        static uint64_t serials = 0;
++        p.serial = ++serials;
++        p.hash = h;
++        p.key = key;
++        p.fin = fin[0];
++        p.bad = run[0].bad || run[1].bad || run[0].ev.size() != run[1].ev.size() || !m_vif1Carry.empty() ||
++                std::memcmp(&fin[0], &fin[1], sizeof(VIFRegisters)) != 0;
++        for (size_t e = 0; !p.bad && e < run[0].ev.size(); ++e)
++        {
++            const VcEvent &x = run[0].ev[e], &y = run[1].ev[e];
++            p.bad = x.kind != y.kind || x.a != y.a || x.b != y.b || x.top != y.top || x.itop != y.itop || (x.kind == 0u && x.a < tteLen);
++        }
++        m_vif1Carry.clear();
++        if (!p.bad)
++        {
++            for (size_t s = 0; s < run[0].snaps.size(); ++s)
++            {
++                const uint32_t *A = reinterpret_cast<const uint32_t *>(run[0].snaps[s].data());
++                const uint32_t *B = reinterpret_cast<const uint32_t *>(run[1].snaps[s].data());
++                const size_t runsAtSeg = p.runs.size();
++                for (uint32_t q = 0; q < PS2_VU1_DATA_SIZE / 16u; ++q)
++                {
++                    alignas(16) uint32_t v[4], m[4];
++                    bool any = false;
++                    for (int l = 0; l < 4; ++l)
++                    {
++                        const bool wr = A[q * 4 + l] == B[q * 4 + l];
++                        m[l] = wr ? 0xFFFFFFFFu : 0u;
++                        v[l] = wr ? A[q * 4 + l] : 0u;
++                        any |= wr;
++                    }
++                    const __m128i vv = _mm_load_si128(reinterpret_cast<const __m128i *>(v));
++                    if (any && (m[0] & m[1] & m[2] & m[3]))
++                    {
++                        if (p.runs.empty() || p.runs.size() == runsAtSeg || p.runs.back().qw + p.runs.back().n != q)
++                            p.runs.push_back(VcRun{q, 0u, static_cast<uint32_t>(p.vals.size())});
++                        ++p.runs.back().n;
++                        p.vals.push_back(vv);
++                    }
++                    else if (any)
++                        p.w.push_back(VcWrite{vv, _mm_load_si128(reinterpret_cast<const __m128i *>(m)), q});
++                }
++                if (s < run[0].ev.size())
++                {
++                    VcEvent e = run[0].ev[s];
++                    if (e.kind == 0u)
++                        e.a -= tteLen;
++                    e.wEnd = static_cast<uint32_t>(p.w.size());
++                    e.rEnd = static_cast<uint32_t>(p.runs.size());
++                    p.ev.push_back(e);
++                }
++            }
++        }
++        ++C.compiles;
++        if (p.bad)
++            ++C.bad;
++        if (slot.v.size() >= 4u)
++            slot.v.pop_front();
++        slot.v.push_back(std::move(p));
++        pk = &slot.v.back();
++    }
++    if (pk->bad)
++    {
++        ++C.interp;
++        return false;
++    }
++    ++C.replays;
++    C.bytes += bytes;
++    slot.rehash = 0;
++    if (checkMode)
++    {
++        const uint32_t tteLen = tte ? 8u : 0u;
++        std::vector<uint8_t> buf(tteLen + bytes);
++        if (tte)
++            std::memcpy(buf.data(), tte, 8);
++        std::memcpy(buf.data() + tteLen, src, bytes);
++        std::vector<uint8_t> shadow(m_vu1Data, m_vu1Data + PS2_VU1_DATA_SIZE);
++        Vif1Recorder r;
++        r.check = true, r.pkt = pk, r.data = buf.data(), r.tteLen = tteLen, r.real = m_vu1Data;
++        m_vu1Data = shadow.data();
++        m_vif1Rec = &r;
++        processVIF1Data(buf.data(), static_cast<uint32_t>(buf.size()));
++        m_vif1Rec = nullptr;
++        m_vu1Data = r.real;
++        vcApplyAll(r.real, *pk, r.cur);
++        const bool regsOk = vif1_regs.cycle == pk->fin.cycle && vif1_regs.mask == pk->fin.mask && vif1_regs.mode == pk->fin.mode &&
++                            vif1_regs.tops == pk->fin.tops && vif1_regs.top == pk->fin.top && vif1_regs.itop == pk->fin.itop &&
++                            vif1_regs.itops == pk->fin.itops && vif1_regs.base == pk->fin.base && vif1_regs.ofst == pk->fin.ofst &&
++                            (vif1_regs.stat & 0x80u) == (pk->fin.stat & 0x80u) && vif1_regs.code == pk->fin.code &&
++                            std::memcmp(vif1_regs.row, pk->fin.row, 16) == 0 && std::memcmp(vif1_regs.col, pk->fin.col, 16) == 0;
++        const bool ok = r.mismatches == 0 && !r.bad && r.idx == pk->ev.size() && regsOk &&
++                        std::memcmp(r.real, shadow.data(), PS2_VU1_DATA_SIZE) == 0;
++        ++C.checks;
++        if (!ok && C.checkBad++ < 20)
++            std::fprintf(stderr, "[vifcache] CHECK FAIL packet %08x (%u bytes): events %zu/%zu regs %d\n", phys, bytes, r.idx, pk->ev.size(), regsOk ? 1 : 0);
++        if ((C.checks & 0x3FFFu) == 0u)
++            std::fprintf(stderr, "[vifcache] %llu replays checked, %llu differ\n", (unsigned long long)C.checks, (unsigned long long)C.checkBad);
++        return true;
++    }
++    VcCur cur;
++    if (timing && (++tN & 0x3FFFu) == 0u)
++        std::fprintf(stderr, "[vifcache] per replay: hash %llu ticks, writes %llu ticks (%llu writes, %llu bytes)\n", (unsigned long long)(tHash / tN),
++                     (unsigned long long)(tApply / tN), (unsigned long long)(tW / tN), (unsigned long long)(C.bytes / C.replays));
++    tW += pk->vals.size() + pk->w.size();
++    for (const VcEvent &e : pk->ev)
++    {
++        t0 = timing ? __rdtsc() : 0;
++        vcApply(m_vu1Data, *pk, cur, e.rEnd, e.wEnd);
++        if (timing)
++            tApply += __rdtsc() - t0;
++        if (e.kind == 0u)
++        {
++            submitGifPacket(GifPathId::Path2, src + e.a, e.b, true, false);
++            continue;
++        }
++        vif1_regs.top = e.top;
++        vif1_regs.itop = e.itop;
++        vif1_regs.tops = e.tops;
++        vif1_regs.stat = (vif1_regs.stat & ~0x80u) | e.dbf;
++        ps2x_capture::g_vif1BatchId = (pk->serial << 16) | static_cast<uint64_t>(&e - pk->ev.data() + 1);
++        if (e.kind == 1u && m_vu1MscalCallback)
++            m_vu1MscalCallback(e.a, e.top, e.itop);
++        else if (e.kind == 2u && m_vu1MscntCallback)
++            m_vu1MscntCallback(e.top, e.itop);
++        ps2x_capture::g_vif1BatchId = 0;
++    }
++    vcApplyAll(m_vu1Data, *pk, cur);
++    const VIFRegisters &f = pk->fin;
++    vif1_regs.cycle = f.cycle, vif1_regs.mask = f.mask, vif1_regs.mode = f.mode, vif1_regs.itops = f.itops;
++    vif1_regs.base = f.base, vif1_regs.ofst = f.ofst, vif1_regs.tops = f.tops, vif1_regs.top = f.top, vif1_regs.itop = f.itop;
++    vif1_regs.code = f.code, vif1_regs.num = f.num;
++    vif1_regs.stat = (vif1_regs.stat & ~0x80u) | (f.stat & 0x80u);
++    std::memcpy(vif1_regs.row, f.row, 16);
++    std::memcpy(vif1_regs.col, f.col, 16);
++    if (static const bool stats = std::getenv("RT_VIFCACHESTATS") != nullptr; stats && (C.replays & 0xFFFFu) == 0u)
++        std::fprintf(stderr, "[vifcache] replays=%llu (%.1f MB) compiles=%llu bad=%llu interpreted=%llu slots=%zu\n",
++                     (unsigned long long)C.replays, C.bytes / 1048576.0, (unsigned long long)C.compiles, (unsigned long long)C.bad,
++                     (unsigned long long)C.interp, C.slots.size());
++    return true;
++}
+--- a/ps2xRuntime/src/lib/ps2_memory.cpp
++++ b/ps2xRuntime/src/lib/ps2_memory.cpp
+@@ -2139,6 +2139,22 @@
+         if (end)
+             st.active = false;
+ 
++        // Prebuilt model packets (CALLed, RET-terminated, or REFed from RAM): replayed from the
++        // packet cache when unchanged (ps2_vif1_interpreter.cpp).
++        if ((id == 6u || id == 3u || id == 4u || id == 0u) && payloadQwc >= 16u && !badAddr && !isScratchpad(dataAddr))
++        {
++            uint32_t src = 0;
++            try
++            {
++                src = translateAddress(dataAddr);
++            }
++            catch (...)
++            {
++                src = PS2_RAM_SIZE;
++            }
++            if (src < PS2_RAM_SIZE && replayVif1Packet(st.tte ? tagBase + tagPhys + 8u : nullptr, src, payloadQwc * 16u))
++                continue;
++        }
+         static thread_local std::vector<uint8_t> buf;
+         static thread_local std::vector<DmaSegment> segs;
+         buf.clear();
+--- a/ps2xRuntime/include/runtime/ps2_memory.h
++++ b/ps2xRuntime/include/runtime/ps2_memory.h
+@@ -529,6 +529,14 @@
+     std::vector<uint8_t> m_vif1Carry;                            // a VIFcode whose data continues in the next DMA tag
+     std::vector<DmaSegment> m_vif1CarrySegs;                     // segments of m_vif1Carry
+     void processVIF1Stream(const uint8_t *data, uint32_t size, const std::vector<DmaSegment> *segs);
++    // Model packet cache (ps2_vif1_interpreter.cpp): a DMA tag's VIF data from RAM, compiled once
++    // into the VU memory writes and events it produces, replayed while its bytes are unchanged.
++    struct Vif1Recorder;
++    struct Vif1PacketCache;
++    Vif1Recorder *m_vif1Rec = nullptr;
++    Vif1PacketCache *m_vif1Cache = nullptr;
++    void vif1RecEvent(uint32_t kind, uint32_t a, uint32_t b, uint32_t top, uint32_t itop);
++    bool replayVif1Packet(const uint8_t *tte, uint32_t phys, uint32_t bytes);
+     std::vector<PendingTransfer> m_pendingGifTransfers;
+     std::vector<PendingTransfer> m_pendingVif0Transfers;
+     std::vector<PendingTransfer> m_pendingVif1Transfers;
+--- a/ps2xRuntime/include/runtime/ps2_capture_hook.h
++++ b/ps2xRuntime/include/runtime/ps2_capture_hook.h
+@@ -24,6 +24,11 @@
+     using CaptureHook = void (*)(uint32_t kind, const uint8_t *data, uint32_t size);
+     inline std::atomic<CaptureHook> g_hook{nullptr};
+ 
++    // Set by the VIF1 packet cache while a cached packet's MSCAL/MSCNT callback runs: identifies
++    // the batch (compiled packet serial << 16 | event index + 1), so its unpacked input is the same
++    // every time this id comes back. 0 otherwise.
++    inline thread_local uint64_t g_vif1BatchId = 0;
++
+     inline void notify(uint32_t kind, const void *data, uint32_t size)
+     {
+         if (auto h = g_hook.load(std::memory_order_relaxed))
+--- a/ps2xRuntime/include/runtime/gs/gs_backend.h
++++ b/ps2xRuntime/include/runtime/gs/gs_backend.h
+@@ -2,9 +2,37 @@
+ 
+ #include "runtime/gs/gs_types.h"
+ 
++#include <atomic>
+ #include <cstdint>
+ #include <vector>
+ 
++// A batch of a VU1 drawing program left for the GPU to transform (RNVMODEL packet, see
++// GS::tryProcessNativeModelPacket): the program's raw input vertices (n x stride qwords of VU
++// memory: position, integer colour, STQ, normal) follow the packet, and the matrices and lights
++// it would have used are here. Equal keys mean equal vertex data.
++struct GSModelPacket
++{
++    uint64_t magic, pad;
++    uint64_t tag[2];        // the GIF tag the program would have sent (PRE/PRIM applied as usual)
++    uint64_t key;
++    uint32_t n, stride;     // vertices, qwords per vertex (3 or 4)
++    uint32_t flags;         // GSModelLit, GSModelXyzf, GSModelClip
++    uint32_t dataBytes;     // n * stride * 16
++    uint32_t pad2[2];
++    float m[16];            // object -> GS screen (homogeneous), columns
++    float cm[16];           // object -> VU clip space, columns
++    float l[16];            // light directions as columns 0..2 (lit)
++    float amb[4];           // ambient (lit)
++    float lc[16];           // light colours as columns (lit)
++};
++static_assert(sizeof(GSModelPacket) % 16 == 0, "GSModelPacket must be whole qwords");
++inline constexpr uint64_t kGsModelMagic = 0x4C45444F4D564E52ull;   // "RNVMODEL"
++enum : uint32_t { GSModelLit = 1u, GSModelXyzf = 2u, GSModelClip = 4u };
++// Capable: set by a backend that draws RNVMODEL packets (SubmitModel returns true).
++// Support: models are sent that way now (capable and switched on).
++inline std::atomic<bool> g_gsModelCapable{false};
++inline std::atomic<bool> g_gsModelSupport{false};
++
+ class GSRasterBackend
+ {
+ public:
+@@ -28,6 +56,8 @@
+             Submit(b);
+         }
+     }
++    // A model batch (see GSModelPacket); data = the raw vertices. False if not supported.
++    virtual bool SubmitModel(const GSDrawState &, const GSModelPacket &, const uint8_t *, uint8_t) { return false; }
+     virtual void LoadClut(const GSTex0Reg &tex0, const GSTexClutReg &texclut) = 0;
+ 
+     virtual void BeginTransfer(const GSTransferCommand &command) = 0;
+--- a/ps2xRuntime/include/runtime/gs/gs_frontend.h
++++ b/ps2xRuntime/include/runtime/gs/gs_frontend.h
+@@ -171,6 +171,7 @@
+     void processImageData(const uint8_t *data, uint32_t sizeBytes);
+     bool tryProcessNativeImageUploadPacket(const uint8_t *data, uint32_t sizeBytes);
+     bool tryProcessNativeVertexPacket(const uint8_t *data, uint32_t sizeBytes);
++    bool tryProcessNativeModelPacket(const uint8_t *data, uint32_t sizeBytes);
+     GSPrimitiveBatch buildDrawBatch(int vertexCount) const;
+     void updatePreferredDisplaySourceForDraw(const GSPrimitiveBatch &batch);
+     GSPresentationRequest buildPresentationRequestUnlocked() const;
+--- a/ps2xRuntime/src/lib/gs/gs_frontend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
+@@ -664,6 +664,8 @@
+         return;
+     if (tryProcessNativeVertexPacket(data, sizeBytes))
+         return;
++    if (tryProcessNativeModelPacket(data, sizeBytes))
++        return;
+ 
+     PS2_IF_AGRESSIVE_LOGS({
+         const uint32_t packetIndex = s_debugGifPacketCount.fetch_add(1, std::memory_order_relaxed);
+@@ -935,6 +937,27 @@
+     return true;
+ }
+ 
++// A model batch for the GPU transform (GSModelPacket): PRE/PRIM applied, then the backend draws
++// it with the current draw state.
++bool GS::tryProcessNativeModelPacket(const uint8_t *data, uint32_t sizeBytes)
++{
++    if (sizeBytes < sizeof(GSModelPacket) || loadLE64(data) != kGsModelMagic)
++        return false;
++    GSModelPacket m;
++    std::memcpy(&m, data, sizeof(m));
++    if (sizeBytes < sizeof(m) + m.dataBytes)
++        return true;
++    m_curQ = 1.0f;
++    if ((m.tag[0] >> 46) & 1)
++        writeRegisterUnlocked(GS_REG_PRIM, (m.tag[0] >> 47) & 0x7FF);
++    GSPrimitiveBatch batch = buildDrawBatch(0);
++    updatePreferredDisplaySourceForDraw(batch);
++    if (m_backend)
++        m_backend->SubmitModel(batch.state, m, data + sizeof(m), m_curFog);
++    m_vtxCount = 0;
++    return true;
++}
++
+ bool GS::tryProcessNativeImageUploadPacket(const uint8_t *data, uint32_t sizeBytes)
+ {
+     constexpr uint32_t kSetupRegisters = 4u;
+--- a/ps2xIOP/src/emulator/core/iop_spu2.cpp
++++ b/ps2xIOP/src/emulator/core/iop_spu2.cpp
+@@ -38,6 +38,14 @@
+ 
+     Spu2::Spu2() : m_ram(RamWords) { reset(); }
+ 
++    namespace
++    {
++        const bool g_spuStat = std::getenv("IOP_SPU2STAT") != nullptr;
++        uint64_t g_spuStatKeyOn[2], g_spuStatSamples, g_spuStatActive, g_spuStatAdma;
++        uint16_t g_spuStatW[0x400];
++        uint32_t g_spuStatWn[0x400];
++    }
++
+     void Spu2::reset()
+     {
+         std::fill(m_ram.begin(), m_ram.end(), 0);
+@@ -136,6 +144,7 @@
+     void Spu2::keyOn(int c, int n)
+     {
+         Voice &v = m_core[c].voices[n];
++        ++g_spuStatKeyOn[c & 1];
+         v.needFetch = true;
+         v.nax = v.blockAddr = v.ssa;
+         v.sampleIndex = 28;   // the first sample step fetches the block at SSA
+@@ -298,6 +307,30 @@
+                     }
+                 }
+             }
++            if (g_spuStat)
++            {
++                for (int c = 0; c < 2; c++)
++                    for (int n = 0; n < 24; n++)
++                        g_spuStatActive += m_core[c].voices[n].env != 0;
++                g_spuStatAdma += ((m_core[0].admas & 1u) && !m_core[0].adma.empty()) + ((m_core[1].admas & 2u) && !m_core[1].adma.empty());
++                if (++g_spuStatSamples == 480000u)
++                {
++                    std::fprintf(stderr, "[spu2stat] 10 s: keyon core0=%llu core1=%llu, mean active voices %.2f, adma streams %.2f\n",
++                                 (unsigned long long)g_spuStatKeyOn[0], (unsigned long long)g_spuStatKeyOn[1], g_spuStatActive / 480000.0,
++                                 g_spuStatAdma / 480000.0);
++                    std::fprintf(stderr, "[spu2stat] effect regs written:");
++                    for (uint32_t o = 0; o < 0x800u; o += 2u)
++                    {
++                        const uint32_t r = o & 0x3FFu;
++                        const bool fx = (o < 0x760u && (r == 0x18C || r == 0x18E || r == 0x194 || r == 0x196 || r == 0x19A || (r >= 0x2E0 && r < 0x340))) ||
++                                        (o >= 0x760u && o < 0x7B0u);
++                        if (fx && g_spuStatWn[o >> 1])
++                            std::fprintf(stderr, " %03x=%04x(x%u)", o, g_spuStatW[o >> 1], g_spuStatWn[o >> 1]);
++                    }
++                    std::fprintf(stderr, "\n");
++                    g_spuStatSamples = g_spuStatActive = g_spuStatAdma = g_spuStatKeyOn[0] = g_spuStatKeyOn[1] = 0;
++                }
++            }
+             // Core 0's output goes through its master volume into core 1's mix.
+             const int32_t l0 = (clamp16(mix[0][0]) * volumeOf(m_core[0].mvolL)) >> 15;
+             const int32_t r0 = (clamp16(mix[0][1]) * volumeOf(m_core[0].mvolR)) >> 15;
+@@ -416,6 +449,8 @@
+             std::fprintf(stderr, "[spu2] w %03x = %04x pc=%x ra=%x\n", off, value, ps2x::iop::detail::g_iopDebugPc, ps2x::iop::detail::g_iopDebugRa);
+         }
+         raw(off) = value;
++        if (g_spuStat)
++            g_spuStatW[off >> 1] = value, ++g_spuStatWn[off >> 1];
+         if (off == kIrqInfo)
+         {
+             m_irqInfo = 0;

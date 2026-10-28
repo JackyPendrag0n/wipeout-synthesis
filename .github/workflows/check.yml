@@ -1,0 +1,67 @@
+# Builds everything that can be built without the game disc, on each platform: PS2Recomp with this
+# port's patches, the recompiler, the runtime, a static FFmpeg and every source file of the port
+# (`build.py --check`). The game itself is generated from each player's own disc, so CI cannot link
+# or run it, and nothing built here is published.
+name: check
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  no-game-data:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: No disc images, disc files or binaries in the repository
+        run: |
+          bad=$(git ls-files | grep -iE '\.(iso|bin|img|wad|wac|irx|elf|exe|dll|so|appimage|pss|vag)$|(^|/)SLUS_' || true)
+          big=$(git ls-files -z | xargs -0 du -k | awk '$1 > 4096 {print $2}')
+          if [ -n "$bad$big" ]; then echo "Not allowed in this repository:"; echo "$bad"; echo "$big"; exit 1; fi
+
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux
+            os: ubuntu-24.04
+            target: linux
+          - name: Windows (MinGW-w64 cross build)
+            os: ubuntu-24.04
+            target: windows
+          - name: macOS (x86-64, Rosetta 2 on Apple Silicon)
+            os: macos-15
+            target: macos
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Tools (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build g++ make pkg-config \
+            libx11-dev libxrandr-dev libxinerama-dev libxcursor-dev libxi-dev libgl1-mesa-dev
+          if [ "${{ matrix.target }}" = windows ]; then sudo apt-get install -y mingw-w64; fi
+
+      - name: Tools (macOS)
+        if: runner.os == 'macOS'
+        run: brew install ninja pkgconf || true
+
+      - name: Cache FFmpeg
+        uses: actions/cache@v4
+        with:
+          path: build/deps/ffmpeg-${{ matrix.target }}
+          key: ffmpeg-n7.1-${{ matrix.target }}-${{ matrix.os }}-${{ hashFiles('build.py') }}
+
+      - name: Compile (build.py --check)
+        run: python3 build.py --check --target ${{ matrix.target }} --jobs 4
+
+      - name: Logs
+        if: failure()
+        run: tail -n 60 build/*.log || true
+
+      - name: Python tools
+        run: python3 -m py_compile build.py tools/*.py

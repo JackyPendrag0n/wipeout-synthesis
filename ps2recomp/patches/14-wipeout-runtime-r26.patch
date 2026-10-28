@@ -1,0 +1,127 @@
+diff --git a/ps2xIOP/src/emulator/core/iop_spu2.cpp b/ps2xIOP/src/emulator/core/iop_spu2.cpp
+index 333b1e6..f8e5ade 100644
+--- a/ps2xIOP/src/emulator/core/iop_spu2.cpp
++++ b/ps2xIOP/src/emulator/core/iop_spu2.cpp
+@@ -41,7 +41,8 @@ namespace ps2x::iop
+     namespace
+     {
+         const bool g_spuStat = std::getenv("IOP_SPU2STAT") != nullptr;
+-        uint64_t g_spuStatKeyOn[2], g_spuStatSamples, g_spuStatActive, g_spuStatAdma;
++        uint64_t g_spuStatKeyOn[2], g_spuStatSamples, g_spuStatActive, g_spuStatAdma, g_spuClock;
++        int32_t g_konMax[2][24];
+         uint16_t g_spuStatW[0x400];
+         uint32_t g_spuStatWn[0x400];
+     }
+@@ -144,6 +145,22 @@ namespace ps2x::iop
+     void Spu2::keyOn(int c, int n)
+     {
+         Voice &v = m_core[c].voices[n];
++        g_konMax[c & 1][n] = 0;
++        if (static const bool kl = std::getenv("IOP_KONLOG") != nullptr; kl)
++        {
++            std::fprintf(stderr, "[kon] @%llu %d:%d ssa %x pitch %x adsr %04x %04x vol %04x %04x lsax %x flags", (unsigned long long)g_spuClock, c, n, v.ssa, v.pitch, v.adsr1, v.adsr2, v.volL, v.volR, v.lsax);
++            for (uint32_t b = 0; b < 160; ++b)
++            {
++                const uint16_t f = static_cast<uint16_t>(m_ram[(v.ssa + b * 8u) % m_ram.size()] >> 8);
++                std::fprintf(stderr, " %x", f);
++                if (f & 1)
++                    break;
++            }
++            uint32_t nz = 0;
++            for (uint32_t w = 0; w < 8u * 29u; ++w)
++                nz += (w & 7u) && m_ram[(v.ssa + w) % m_ram.size()] != 0;
++            std::fprintf(stderr, " nonzero words %u\n", nz);
++        }
+         ++g_spuStatKeyOn[c & 1];
+         v.needFetch = true;
+         v.nax = v.blockAddr = v.ssa;
+@@ -266,6 +283,7 @@ namespace ps2x::iop
+         envelopeTick(v);
+         const int32_t s = v.last + (((v.cur - v.last) * static_cast<int32_t>(v.counter)) >> 12);
+         v.out = (s * v.env) >> 15;
++        g_konMax[c & 1][n] = std::max(g_konMax[c & 1][n], std::abs(v.out));
+         return v.out;
+     }
+ 
+@@ -307,6 +325,7 @@ namespace ps2x::iop
+                     }
+                 }
+             }
++            ++g_spuClock;
+             if (g_spuStat)
+             {
+                 for (int c = 0; c < 2; c++)
+@@ -541,6 +560,10 @@ namespace ps2x::iop
+             for (int i = 0; i < count; i++)
+                 if ((value & (1u << i)) && core.voices[base + i].phase != Voice::Phase::Off)
+                 {
++                    if (static const bool kl = std::getenv("IOP_KONLOG") != nullptr; kl)
++                        std::fprintf(stderr, "[koff] @%llu %d:%d max out %d env %d mixed %d/%d vol %04x %04x\n", (unsigned long long)g_spuClock, c, base + i, g_konMax[c & 1][base + i],
++                                     core.voices[base + i].env, (int)((core.vmixl >> (base + i)) & 1u), (int)((core.vmixr >> (base + i)) & 1u),
++                                     core.voices[base + i].volL, core.voices[base + i].volR);
+                     core.voices[base + i].phase = Voice::Phase::Release;
+                     core.voices[base + i].envWait = 0;
+                 }
+diff --git a/ps2xRuntime/CMakeLists.txt b/ps2xRuntime/CMakeLists.txt
+index 0fd2f60..8bf6b3b 100644
+--- a/ps2xRuntime/CMakeLists.txt
++++ b/ps2xRuntime/CMakeLists.txt
+@@ -523,6 +523,12 @@ target_link_libraries(ps2EntryRunner
+     ps2_runtime
+ )
+ 
++# The GPU renderer asks GLFW for a newer OpenGL context than raylib's 3.3 (see
++# __wrap_glfwCreateWindow in rufftrigger_gpu.cpp): some drivers give exactly the version asked for.
++if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND NOT PS2X_IS_ANDROID)
++    target_link_options(ps2EntryRunner PRIVATE "-Wl,--wrap=glfwCreateWindow")
++endif()
++
+ if(PS2X_ENABLE_DEBUG_UI AND NOT PS2X_IS_VITA AND NOT PS2X_IS_ANDROID)
+     target_sources(ps2EntryRunner PRIVATE
+         src/lib/ps2_debug_panel.cpp
+diff --git a/ps2xRuntime/include/runtime/gs/gs_frontend.h b/ps2xRuntime/include/runtime/gs/gs_frontend.h
+index 3e0aa72..a65be4a 100644
+--- a/ps2xRuntime/include/runtime/gs/gs_frontend.h
++++ b/ps2xRuntime/include/runtime/gs/gs_frontend.h
+@@ -203,6 +203,7 @@ private:
+     uint64_t m_scanmsk = 0;
+     uint64_t m_dimx = 0;
+     uint64_t m_dthe = 0;
++    uint64_t m_portMark = 0;
+     uint64_t m_colclamp = 0;
+     GSTexaReg m_texa{0u, false, 0u};
+     GSTexClutReg m_texclut{0u, 0u, 0u};
+diff --git a/ps2xRuntime/include/runtime/gs/gs_types.h b/ps2xRuntime/include/runtime/gs/gs_types.h
+index 836a3ff..0714162 100644
+--- a/ps2xRuntime/include/runtime/gs/gs_types.h
++++ b/ps2xRuntime/include/runtime/gs/gs_types.h
+@@ -241,6 +241,7 @@ struct GSDrawState
+     uint64_t dimx = 0;
+     uint64_t dthe = 0;
+     uint64_t colclamp = 0;
++    uint64_t portMark = 0;   // last write to 0x7E, not a GS register: a port's marker for the renderer
+     uint8_t fogR = 0;
+     uint8_t fogG = 0;
+     uint8_t fogB = 0;
+diff --git a/ps2xRuntime/src/lib/gs/gs_frontend.cpp b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
+index 96060ae..81d673a 100644
+--- a/ps2xRuntime/src/lib/gs/gs_frontend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
+@@ -1580,6 +1580,9 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
+     case GS_REG_DTHE:
+         m_dthe = value;
+         break;
++    case 0x7E:   // not a GS register: a marker a port writes for the renderer
++        m_portMark = value;
++        break;
+     case GS_REG_COLCLAMP:
+         m_colclamp = value;
+         break;
+@@ -1844,6 +1847,7 @@ GSPrimitiveBatch GS::buildDrawBatch(int vertexCount) const
+     batch.state.scanmsk = m_scanmsk;
+     batch.state.dimx = m_dimx;
+     batch.state.dthe = m_dthe;
++    batch.state.portMark = m_portMark;
+     batch.state.colclamp = m_colclamp;
+     batch.state.fogR = m_fogR;
+     batch.state.fogG = m_fogG;

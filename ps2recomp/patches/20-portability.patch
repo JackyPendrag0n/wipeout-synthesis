@@ -1,0 +1,61 @@
+diff --git a/ps2xRuntime/CMakeLists.txt b/ps2xRuntime/CMakeLists.txt
+index 8bf6b3b..f6615ea 100644
+--- a/ps2xRuntime/CMakeLists.txt
++++ b/ps2xRuntime/CMakeLists.txt
+@@ -253,7 +253,7 @@ option(PS2X_ENABLE_FFMPEG "Enable FFmpeg-backed MPEG video decoding" ${PS2X_ENAB
+ if(NOT PS2X_ENABLE_FFMPEG)
+     message(STATUS "FFmpeg disabled; MPEG video decode falls back to stub frames")
+     add_library(ffmpeg INTERFACE)
+-elseif(WIN32)
++elseif(WIN32 AND MSVC)
+     include(ExternalProject)
+ 
+     set(FFMPEG_PREBUILT_TAG "n7.1-241205")
+@@ -525,8 +525,17 @@ target_link_libraries(ps2EntryRunner
+ 
+ # The GPU renderer asks GLFW for a newer OpenGL context than raylib's 3.3 (see
+ # __wrap_glfwCreateWindow in rufftrigger_gpu.cpp): some drivers give exactly the version asked for.
+-if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND NOT PS2X_IS_ANDROID)
++if((CMAKE_SYSTEM_NAME STREQUAL "Linux" AND NOT PS2X_IS_ANDROID) OR MINGW)
+     target_link_options(ps2EntryRunner PRIVATE "-Wl,--wrap=glfwCreateWindow")
++    target_compile_definitions(ps2EntryRunner PRIVATE RT_WRAP_GLFW_CREATE=1)
++endif()
++
++# MinGW: the generated translation units have more sections than COFF allows by default, and a
++# static C++ runtime keeps the .exe free of libstdc++/libgcc/winpthread DLLs.
++if(MINGW)
++    target_compile_options(ps2_runtime PRIVATE "-Wa,-mbig-obj")
++    target_compile_options(ps2EntryRunner PRIVATE "-Wa,-mbig-obj")
++    target_link_options(ps2EntryRunner PRIVATE -static -static-libgcc -static-libstdc++)
+ endif()
+ 
+ if(PS2X_ENABLE_DEBUG_UI AND NOT PS2X_IS_VITA AND NOT PS2X_IS_ANDROID)
+diff --git a/ps2xRuntime/src/main.cpp b/ps2xRuntime/src/main.cpp
+index 563bcbd..fbbbaa8 100644
+--- a/ps2xRuntime/src/main.cpp
++++ b/ps2xRuntime/src/main.cpp
+@@ -23,6 +23,9 @@
+ #include <cstring>
+ #endif
+ 
++// The port's launcher (src/game/wipeout_launcher.cpp): finds or extracts the game files.
++std::filesystem::path WipeoutResolveBoot(int &argc, char **argv);
++
+ namespace
+ {
+ #if defined(__ANDROID__)
+@@ -173,7 +176,13 @@ int main(int argc, char *argv[])
+ 
+     try
+     {
+-        std::filesystem::path pathObj = getExecutablePath(argc, argv);
++        std::filesystem::path pathObj = WipeoutResolveBoot(argc, argv);
++        if (pathObj.empty())
++        {
++            std::cout.flush();
++            std::cerr.flush();
++            std::_Exit(1);
++        }
+ 
+         std::string filePathStr = pathObj.string();
+         std::string elfName = pathObj.filename().string();

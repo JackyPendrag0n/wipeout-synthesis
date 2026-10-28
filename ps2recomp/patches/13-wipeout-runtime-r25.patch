@@ -1,0 +1,21 @@
+--- a/ps2xRuntime/include/runtime/gs/gs_backend.h
++++ b/ps2xRuntime/include/runtime/gs/gs_backend.h
+@@ -16,7 +16,7 @@
+     uint64_t tag[2];        // the GIF tag the program would have sent (PRE/PRIM applied as usual)
+     uint64_t key;
+     uint32_t n, stride;     // vertices, qwords per vertex (3 or 4)
+-    uint32_t flags;         // GSModelLit, GSModelXyzf, GSModelClip
++    uint32_t flags;         // GSModelLit, GSModelXyzf, GSModelClip, GSModelEnv
+     uint32_t dataBytes;     // n * stride * 16
+     uint32_t pad2[2];
+     float m[16];            // object -> GS screen (homogeneous), columns
+@@ -27,7 +27,8 @@
+ };
+ static_assert(sizeof(GSModelPacket) % 16 == 0, "GSModelPacket must be whole qwords");
+ inline constexpr uint64_t kGsModelMagic = 0x4C45444F4D564E52ull;   // "RNVMODEL"
+-enum : uint32_t { GSModelLit = 1u, GSModelXyzf = 2u, GSModelClip = 4u };
++// Env: STQ.xy = ((l * normal).xy + 1 + amb.xy) * amb.z (environment map; amb = the program's vf08).
++enum : uint32_t { GSModelLit = 1u, GSModelXyzf = 2u, GSModelClip = 4u, GSModelEnv = 8u };
+ // Capable: set by a backend that draws RNVMODEL packets (SubmitModel returns true).
+ // Support: models are sent that way now (capable and switched on).
+ inline std::atomic<bool> g_gsModelCapable{false};

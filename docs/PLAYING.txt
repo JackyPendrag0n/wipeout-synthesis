@@ -1,0 +1,27 @@
+WipEout Fusion PC
+=================
+
+This folder holds the program only. It needs your own WipEout Fusion disc (NTSC-U, SLUS-20462)
+as an .iso file.
+
+First start
+  Windows: drag your .iso onto WipEoutFusion.exe.
+  Linux/macOS: ./wipeout-fusion "/path/to/WipEout Fusion.iso"
+  The disc is extracted once into a "game" folder next to the program (about 2.4 GB).
+  You can also put the .iso next to the program and just start it.
+
+After that, start the program (double-click on Windows). Saves are in game/mc0, settings in
+game/graphics.ini.
+
+Controls (keyboard / gamepad)
+  Cross X or Space / A      Circle C or Esc / B     Square Z / X      Triangle V / Y
+  L1 Q / LB                 R1 E / RB               L2 Left Shift / LT   R2 Right Shift / RT
+  D-pad arrow keys          Left stick W A S D      Start Enter          Select Tab
+  WipEout default: Cross accelerates, R1 fires, Square absorbs.
+
+  Options > Graphics in the game menu: resolution, display mode, 16:9, FOV, vsync, FPS, fast loading.
+  F10 (or L3 + R3): PC overlay with the same settings plus fun/debug options.
+  F9: next internal resolution. F11: full screen.
+
+If something goes wrong, run it from a terminal (Windows: cmd) and look at the log; RT_FPSLOG=1
+prints speed and frame pacing, RT_GL33=1 helps when the window does not open.

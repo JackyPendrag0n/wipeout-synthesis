@@ -1,0 +1,15 @@
+# Cross-compile the Windows build from Linux with MinGW-w64 (Debian/Ubuntu: apt install mingw-w64).
+# The posix thread model is needed for std::thread / std::mutex.
+set(CMAKE_SYSTEM_NAME Windows)
+set(CMAKE_SYSTEM_PROCESSOR x86_64)
+set(TOOLCHAIN_PREFIX x86_64-w64-mingw32)
+
+find_program(CMAKE_C_COMPILER NAMES ${TOOLCHAIN_PREFIX}-gcc-posix ${TOOLCHAIN_PREFIX}-gcc REQUIRED)
+find_program(CMAKE_CXX_COMPILER NAMES ${TOOLCHAIN_PREFIX}-g++-posix ${TOOLCHAIN_PREFIX}-g++ REQUIRED)
+find_program(CMAKE_RC_COMPILER NAMES ${TOOLCHAIN_PREFIX}-windres windres)
+
+set(CMAKE_FIND_ROOT_PATH /usr/${TOOLCHAIN_PREFIX} ${PS2X_WIN_DEPS_PREFIX})
+set(CMAKE_FIND_ROOT_PATH_MODE_PROGRAM NEVER)
+set(CMAKE_FIND_ROOT_PATH_MODE_LIBRARY ONLY)
+set(CMAKE_FIND_ROOT_PATH_MODE_INCLUDE ONLY)
+set(CMAKE_FIND_ROOT_PATH_MODE_PACKAGE ONLY)

@@ -1,0 +1,140 @@
+diff -ruN a/ps2xRuntime/include/runtime/gs/ps2_gif_arbiter.h b/ps2xRuntime/include/runtime/gs/ps2_gif_arbiter.h
+--- a/ps2xRuntime/include/runtime/gs/ps2_gif_arbiter.h	2026-10-21 18:35:14.126024910 +0000
++++ b/ps2xRuntime/include/runtime/gs/ps2_gif_arbiter.h	2026-10-21 18:35:14.095936096 +0000
+@@ -33,6 +33,15 @@
+     void submit(GifPathId pathId, const uint8_t *data, uint32_t sizeBytes, bool path2DirectHl = false);
+ 
+     void drain();
++    // Nothing queued: a packet that would be drained right away goes straight to the GS, without
++    // the queue's copy and sort (the order is the same).
++    bool processNow(const uint8_t *data, uint32_t sizeBytes)
++    {
++        if (!m_queue.empty() || !m_processFn)
++            return false;
++        m_processFn(data, sizeBytes);
++        return true;
++    }
+     bool empty() const { return m_queue.empty(); }
+ 
+ private:
+diff -ruN a/ps2xRuntime/include/runtime/ps2_memory.h b/ps2xRuntime/include/runtime/ps2_memory.h
+--- a/ps2xRuntime/include/runtime/ps2_memory.h	2026-10-21 18:35:14.125889225 +0000
++++ b/ps2xRuntime/include/runtime/ps2_memory.h	2026-10-21 18:35:14.081962612 +0000
+@@ -7,6 +7,8 @@
+ #include <functional>
+ #include <vector>
+ #include <unordered_map>
++#include <algorithm>
++#include <iterator>
+ #include <atomic>
+ #include <iostream>
+ #include <mutex>
+@@ -261,6 +263,54 @@
+     std::vector<uint32_t> targets; // Jump targets
+ };
+ 
++// EE I/O registers by address: a flat table for the 0x10000000..0x1000FFFF words the game reads
++// and writes all the time, a map for anything else (same interface as the map it replaces).
++class IoRegisterFile
++{
++public:
++    struct Ref
++    {
++        uint32_t *v;
++        uint32_t &second;   // the register itself (writes go through)
++        Ref *operator->() { return this; }
++        const Ref *operator->() const { return this; }
++        bool operator!=(const Ref &o) const { return v != o.v; }
++        bool operator==(const Ref &o) const { return v == o.v; }
++    };
++    size_t count(uint32_t a) const
++    {
++        if (flat(a)) return m_present[idx(a)];
++        return m_other.count(a);
++    }
++    uint32_t &operator[](uint32_t a)
++    {
++        if (flat(a)) { m_present[idx(a)] = 1; return m_vals[idx(a)]; }
++        return m_other[a];
++    }
++    Ref find(uint32_t a)
++    {
++        if (flat(a))
++            return m_present[idx(a)] ? Ref{&m_vals[idx(a)], m_vals[idx(a)]} : end();
++        auto it = m_other.find(a);
++        return it == m_other.end() ? end() : Ref{&it->second, it->second};
++    }
++    Ref end() { return Ref{nullptr, m_none}; }
++    void clear()
++    {
++        std::fill(std::begin(m_present), std::end(m_present), 0);
++        std::fill(std::begin(m_vals), std::end(m_vals), 0u);
++        m_other.clear();
++    }
++
++private:
++    static bool flat(uint32_t a) { return (a & 0xFFFF0003u) == 0x10000000u; }
++    static uint32_t idx(uint32_t a) { return (a & 0xFFFFu) >> 2; }
++    uint32_t m_vals[0x4000] = {};
++    uint8_t m_present[0x4000] = {};
++    std::unordered_map<uint32_t, uint32_t> m_other;
++    uint32_t m_none = 0;
++};
++
+ class PS2Memory
+ {
+ public:
+@@ -403,7 +453,7 @@
+     std::atomic<uint64_t> m_vu0CodeGeneration{0};
+     std::atomic<uint64_t> m_vu1CodeGeneration{0};
+     // I/O registers
+-    std::unordered_map<uint32_t, uint32_t> m_ioRegisters;
++    IoRegisterFile m_ioRegisters;
+ 
+     // Registers
+     GSRegisters gs_regs;
+diff -ruN a/ps2xRuntime/src/lib/Kernel/Stubs/GS.cpp b/ps2xRuntime/src/lib/Kernel/Stubs/GS.cpp
+--- a/ps2xRuntime/src/lib/Kernel/Stubs/GS.cpp	2026-10-21 18:35:14.124864874 +0000
++++ b/ps2xRuntime/src/lib/Kernel/Stubs/GS.cpp	2026-10-21 18:35:14.037132748 +0000
+@@ -632,7 +632,7 @@
+             return;
+         }
+ 
+-        uint32_t dbp = (static_cast<uint32_t>(img.vram_addr) * 2048u) / 256u;
++        uint32_t dbp = static_cast<uint32_t>(img.vram_addr); // libgraph: word address / 64 (blocks)
+         uint32_t dsax = static_cast<uint32_t>(img.x);
+         uint32_t dsay = static_cast<uint32_t>(img.y);
+ 
+@@ -697,7 +697,7 @@
+             return;
+         }
+ 
+-        uint32_t sbp = (static_cast<uint32_t>(img.vram_addr) * 2048u) / 256u;
++        uint32_t sbp = static_cast<uint32_t>(img.vram_addr); // libgraph: word address / 64 (blocks)
+         uint64_t bitbltbuf = (static_cast<uint64_t>(sbp & 0x3FFFu) << 0) |
+                              (static_cast<uint64_t>(fbw & 0x3Fu) << 16) |
+                              (static_cast<uint64_t>(img.psm & 0x3Fu) << 24) |
+diff -ruN a/ps2xRuntime/src/lib/Kernel/Stubs/LibC.cpp b/ps2xRuntime/src/lib/Kernel/Stubs/LibC.cpp
+--- a/ps2xRuntime/src/lib/Kernel/Stubs/LibC.cpp	2026-10-21 18:35:14.125156580 +0000
++++ b/ps2xRuntime/src/lib/Kernel/Stubs/LibC.cpp	2026-10-21 18:35:14.051203244 +0000
+@@ -118,6 +118,8 @@
+         uint32_t destAddr = getRegU32(ctx, 4); // $a0
+         uint32_t srcAddr = getRegU32(ctx, 5);  // $a1
+         uint32_t size = getRegU32(ctx, 6);     // $a2
++        if (size > PS2_RAM_SIZE)
++            std::cerr << "[memcpy] bad size from ra=0x" << std::hex << getRegU32(ctx, 31) << " dst=0x" << destAddr << " src=0x" << srcAddr << std::dec << std::endl;
+         size = sanitizeMemTransferSize(size, "memcpy");
+ 
+         uint32_t copied = 0u;
+diff -ruN a/ps2xRuntime/src/lib/ps2_memory.cpp b/ps2xRuntime/src/lib/ps2_memory.cpp
+--- a/ps2xRuntime/src/lib/ps2_memory.cpp	2026-10-21 18:35:14.125600879 +0000
++++ b/ps2xRuntime/src/lib/ps2_memory.cpp	2026-10-21 18:35:14.067111057 +0000
+@@ -2570,6 +2570,8 @@
+         flushMaskedPath3Packets(false);
+     }
+ 
++    if (m_gifArbiter && drainImmediately && m_gifArbiter->processNow(data, sizeBytes))
++        return;
+     if (m_gifArbiter)
+         m_gifArbiter->submit(pathId, data, sizeBytes, path2DirectHl);
+     else if (m_gifPacketCallback)

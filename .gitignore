@@ -1,0 +1,13 @@
+# Everything generated from your disc stays local: never commit it.
+/build/
+/dist/
+*.iso
+*.ISO
+*.bin
+*.img
+*.WAD
+*.IRX
+SLUS_*
+game/mc0/
+graphics.ini
+__pycache__/
